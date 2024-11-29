@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"math"
 	"slices"
 	"sort"
@@ -1397,30 +1398,42 @@ func funcHistogramQuantile(vals []parser.Value, args parser.Expressions, enh *Ev
 
 // === resets(Matrix parser.ValueTypeMatrix) (Vector, Annotations) ===
 func funcResets(vals []parser.Value, args parser.Expressions, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
-	floats := vals[0].(Matrix)[0].Floats
-	histograms := vals[0].(Matrix)[0].Histograms
 	resets := 0
+	isFirstSample := true
+	prevSample := Sample{}
+	itr := NewStorageSeries(vals[0].(Matrix)[0]).Iterator(nil)
 
-	if len(floats) > 1 {
-		prev := floats[0].F
-		for _, sample := range floats[1:] {
-			current := sample.F
-			if current < prev {
-				resets++
+	for valueType := itr.Next(); valueType != chunkenc.ValNone; valueType = itr.Next() {
+		switch valueType {
+		case chunkenc.ValFloat:
+			{
+				_, curF := itr.At()
+				switch {
+				case isFirstSample:
+					// Do nothing as it's first sample
+				case prevSample.H == nil && curF < prevSample.F:
+					resets++
+				case prevSample.H != nil:
+					resets++
+				}
+				prevSample.H = nil
+				prevSample.F = curF
 			}
-			prev = current
-		}
-	}
-
-	if len(histograms) > 1 {
-		prev := histograms[0].H
-		for _, sample := range histograms[1:] {
-			current := sample.H
-			if current.DetectReset(prev) {
-				resets++
+		case chunkenc.ValFloatHistogram:
+			{
+				_, curH := itr.AtFloatHistogram(nil)
+				switch {
+				case isFirstSample:
+					// Do nothing as it's first sample
+				case prevSample.H != nil && curH.DetectReset(prevSample.H):
+					resets++
+				case prevSample.H == nil:
+					resets++
+				}
+				prevSample.H = curH
 			}
-			prev = current
 		}
+		isFirstSample = false
 	}
 
 	return append(enh.Out, Sample{F: float64(resets)}), nil
@@ -1428,54 +1441,44 @@ func funcResets(vals []parser.Value, args parser.Expressions, enh *EvalNodeHelpe
 
 // === changes(Matrix parser.ValueTypeMatrix) (Vector, Annotations) ===
 func funcChanges(vals []parser.Value, args parser.Expressions, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
-	floats := vals[0].(Matrix)[0].Floats
-	histograms := vals[0].(Matrix)[0].Histograms
 	changes := 0
-	if len(floats) == 0 && len(histograms) == 0 {
-		return enh.Out, nil
-	}
+	isFirstSample := true
+	prevSample := Sample{}
+	itr := NewStorageSeries(vals[0].(Matrix)[0]).Iterator(nil)
 
-	var prevSample, curSample Sample
-	for iFloat, iHistogram := 0, 0; iFloat < len(floats) || iHistogram < len(histograms); {
-		switch {
-		// Process a float sample if no histogram sample remains or its timestamp is earlier.
-		// Process a histogram sample if no float sample remains or its timestamp is earlier.
-		case iHistogram >= len(histograms) || iFloat < len(floats) && floats[iFloat].T < histograms[iHistogram].T:
+	for valueType := itr.Next(); valueType != chunkenc.ValNone; valueType = itr.Next() {
+		switch valueType {
+		case chunkenc.ValFloat:
 			{
-				curSample.F = floats[iFloat].F
-				curSample.H = nil
-				iFloat++
-			}
-		case iFloat >= len(floats) || iHistogram < len(histograms) && floats[iFloat].T > histograms[iHistogram].T:
-			{
-				curSample.H = histograms[iHistogram].H
-				iHistogram++
-			}
-		}
-		// Skip the comparison for the first sample, just initialize prevSample.
-		if iFloat+iHistogram == 1 {
-			prevSample = curSample
-			continue
-		}
-		switch {
-		case prevSample.H == nil && curSample.H == nil:
-			{
-				if curSample.F != prevSample.F && !(math.IsNaN(curSample.F) && math.IsNaN(prevSample.F)) {
+				_, curF := itr.At()
+				switch {
+				case isFirstSample:
+					// Do nothing as it's first sample
+				case prevSample.H == nil:
+					if curF != prevSample.F && !(math.IsNaN(curF) && math.IsNaN(prevSample.F)) {
+						changes++
+					}
+				case prevSample.H != nil:
 					changes++
 				}
+				prevSample.H = nil
+				prevSample.F = curF
 			}
-		case prevSample.H != nil && curSample.H == nil, prevSample.H == nil && curSample.H != nil:
+		case chunkenc.ValFloatHistogram:
 			{
-				changes++
-			}
-		case prevSample.H != nil && curSample.H != nil:
-			{
-				if !curSample.H.Equals(prevSample.H) {
+				_, curH := itr.AtFloatHistogram(nil)
+				switch {
+				case isFirstSample:
+					// Do nothing as it's first sample
+				case prevSample.H != nil && !curH.Equals(prevSample.H):
+					changes++
+				case prevSample.H == nil:
 					changes++
 				}
+				prevSample.H = curH
 			}
 		}
-		prevSample = curSample
+		isFirstSample = false
 	}
 
 	return append(enh.Out, Sample{F: float64(changes)}), nil
